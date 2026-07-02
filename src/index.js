@@ -6,40 +6,35 @@ import cors from 'cors';
 import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
 import { createRedis } from './redis.js';
+import { producer, createConsumer } from './kafka.js';
 import { log } from './logger.js';
+import { ROUTES, buildMessage } from './domain/router.js';
 
 const PORT   = process.env.GATEWAY_PORT ?? 3000;
-const ORIGIN = process.env.CLIENT_ORIGIN ?? 'http://localhost:5173';
-
-const ROUTES = {
-  'room:create':          'svc:room',
-  'room:join':            'svc:room',
-  'disparo:realizar':     'svc:game',
-  'salva:disparo':        'svc:game',
-  'poder:usar':           'svc:game',
-  'colocacion:set':       'svc:game',
-  'contramedida:activar': 'svc:game',
-  'chat:mensaje':         'svc:chat',
-};
+const ORIGIN = process.env.CLIENT_ORIGIN ?? '*';
 
 const app    = express();
 const server = createServer(app);
-const io     = new Server(server, { cors: { origin: ORIGIN } });
+const io     = new Server(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+});
 
-app.use(helmet());
-app.use(cors({ origin: ORIGIN }));
+app.use(helmet({ crossOriginResourcePolicy: false }));
+app.use(cors({ origin: '*' }));
 app.use(express.json());
 
-const pub = createRedis();
-const sub = createRedis();
+// Redis — solo estado: rate limiting, reconexión, KPIs
+const redis = createRedis();
+await redis.connect();
 
-await pub.connect();
-await sub.connect();
+// Kafka — mensajería entre servicios
+await producer.connect();
+const consumer = createConsumer('gateway-group');
 
-// DOMF1302 — /health con ping Redis real, redis status y uptime
+// DOMF1302 — /health con ping Redis real
 app.get('/health', async (_req, res) => {
   try {
-    const ping = await pub.ping();
+    const ping = await redis.ping();
     res.json({
       service:   'gateway',
       status:    'ok',
@@ -52,19 +47,19 @@ app.get('/health', async (_req, res) => {
   }
 });
 
-// UIUXF1101 — /kpis expone los KPIs calculados por Observability Service desde Redis
+// UIUXF1101 — /kpis desde Redis State (escritos por Observability Service)
 app.get('/kpis', async (_req, res) => {
   try {
     const today   = new Date().toISOString().split('T')[0];
-    const raw     = await pub.hgetall(`stats:kpi:${today}`) ?? {};
+    const raw     = await redis.hgetall(`stats:kpi:${today}`) ?? {};
     const started = parseInt(raw.games_started ?? 0);
     const ended   = parseInt(raw.games_ended   ?? 0);
     const disc    = parseInt(raw.disconnections ?? 0);
     const recon   = parseInt(raw.reconnections  ?? 0);
-    const pico    = await pub.get('metrics:pico:salas') ?? 0;
+    const pico    = await redis.get('metrics:pico:salas') ?? 0;
     res.json({
-      tasa_completacion: started ? ((ended   / started) * 100).toFixed(1) + '%' : 'N/A',
-      tasa_reconexion:   disc    ? ((recon   / disc)    * 100).toFixed(1) + '%' : 'N/A',
+      tasa_completacion: started ? ((ended / started) * 100).toFixed(1) + '%' : 'N/A',
+      tasa_reconexion:   disc    ? ((recon  / disc)   * 100).toFixed(1) + '%' : 'N/A',
       pico_salas:        pico,
       date:              today,
     });
@@ -73,7 +68,7 @@ app.get('/kpis', async (_req, res) => {
   }
 });
 
-// DOMF102 — Verificación JWT (ya completado)
+// DOMF102 — Verificación JWT antes de cualquier evento
 io.use((socket, next) => {
   const token = socket.handshake.auth?.token ?? socket.handshake.query?.token;
   if (!token) return next(new Error('sin_token'));
@@ -85,11 +80,11 @@ io.use((socket, next) => {
   }
 });
 
-// DOMF002 — Rate limiting: ventana deslizante 1s, máx 20 eventos por IP
+// DOMF002 — Rate limiting con Redis State (ventana 1s, máx 20 eventos/IP)
 io.use(async (socket, next) => {
   const key   = `ratelimit:${socket.handshake.address}`;
-  const count = await pub.incr(key);
-  if (count === 1) await pub.expire(key, 1);
+  const count = await redis.incr(key);
+  if (count === 1) await redis.expire(key, 1);
   if (count > 20) {
     log.warn('rate_limit_exceeded', socket.handshake.address);
     return next(new Error('rate_limit_exceeded'));
@@ -97,61 +92,85 @@ io.use(async (socket, next) => {
   next();
 });
 
-// DOMF301 — Suscribirse a gw:broadcast, evt:TimerTick y evt:PhaseChanged
-await sub.subscribe('gw:broadcast', 'evt:TimerTick', 'evt:PhaseChanged');
-
-sub.on('message', (channel, raw) => {
+// DOMF301 — Consumir Kafka y hacer broadcast a clientes Socket.io
+async function startConsumer() {
   try {
-    if (channel === 'gw:broadcast') {
-      const { roomId, event, payload } = JSON.parse(raw);
-      // Evento especial: Room Service pide que el socket se una a la sala Socket.io
-      if (event === 'room:join-socket-room') {
-        const socket = io.sockets.sockets.get(roomId);
-        socket?.join(payload.codigo);
-        log.info(`socket ${roomId} joined room ${payload.codigo}`);
-        return;
-      }
-      io.to(roomId).emit(event, payload);
-    } else if (channel === 'evt:TimerTick') {
-      const { data } = JSON.parse(raw);
-      io.to(data.codigo).emit('timer:tick', data);
-    } else if (channel === 'evt:PhaseChanged') {
-      // Proyecto.md §7.1: Gateway reenvía cambios de fase a todos los clientes de la sala
-      const { data } = JSON.parse(raw);
-      io.to(data.codigo).emit('phase:changed', data);
-    }
+    await consumer.connect();
+    await consumer.subscribe({ topics: ['gw.broadcast', 'evt.timer', 'evt.game'], fromBeginning: false });
+
+    consumer.on(consumer.events.CRASH, async () => {
+      log.warn('kafka consumer crasheó — reconectando en 5s...');
+      setTimeout(async () => {
+        try {
+          await consumer.disconnect();
+          await startConsumer();
+        } catch (err) {
+          log.error('error al reconectar consumer —', err.message);
+        }
+      }, 5000);
+    });
+
+    await consumer.run({
+      eachMessage: async ({ topic, message }) => {
+        try {
+          const raw = message.value.toString();
+          if (topic === 'gw.broadcast') {
+            const { roomId, event, payload } = JSON.parse(raw);
+            if (event === 'room:join-socket-room') {
+              const socket = io.sockets.sockets.get(roomId);
+              socket?.join(payload.codigo);
+              log.info(`socket ${roomId} joined room ${payload.codigo}`);
+              return;
+            }
+            io.to(roomId).emit(event, payload);
+          } else if (topic === 'evt.timer') {
+            const msg = JSON.parse(raw);
+            if (msg.type === 'TimerTick') io.to(msg.data.codigo).emit('timer:tick', msg.data);
+          } else if (topic === 'evt.game') {
+            const msg = JSON.parse(raw);
+            if (msg.type === 'PhaseChanged') io.to(msg.data.codigo).emit('phase:changed', msg.data);
+          }
+        } catch (err) {
+          log.error('kafka message parse fail —', err.message);
+        }
+      },
+    });
+    log.info('kafka consumer listo');
   } catch (err) {
-    log.error('broadcast parse fail —', err.message);
+    log.warn(`kafka consumer no disponible, reintentando en 5s — ${err.message}`);
+    setTimeout(startConsumer, 5000);
   }
-});
+}
+
+startConsumer();
 
 io.on('connection', async (socket) => {
   log.info('cliente conectado:', socket.id);
 
-  // DOMF401 — Reconexión: buscar si el jugador ya tiene sala activa en Redis
+  // DOMF401 — Reconexión: buscar sala activa en Redis State
   const playerId = socket.user.sub;
   try {
-    const keys = await pub.keys('sala:*');
+    const keys = await redis.keys('sala:*');
     for (const key of keys) {
-      // Saltar sub-claves (sala:{codigo}:chat, :energia:*, :salva:*)
-      const parts = key.split(':');
-      if (parts.length !== 2) continue;
-
-      const raw = await pub.get(key);
+      if (key.split(':').length !== 2) continue;
+      const raw = await redis.get(key);
       if (!raw) continue;
-      const sala = JSON.parse(raw);
+      const sala    = JSON.parse(raw);
       const jugador = sala?.jugadores?.find((j) => j.id === playerId);
       if (jugador && sala.fase !== 'FIN') {
         socket.join(sala.codigo);
-        jugador.socketId = socket.id;
+        jugador.socketId  = socket.id;
         jugador.conectado = true;
-        await pub.set(key, JSON.stringify(sala));
-        await pub.publish('evt:PlayerReconnected', JSON.stringify({
-          type:      'PlayerReconnected',
-          source:    'gateway',
-          timestamp: Date.now(),
-          data:      { codigo: sala.codigo, playerId },
-        }));
+        await redis.set(key, JSON.stringify(sala));
+        await producer.send({
+          topic:    'evt.room',
+          messages: [{ key: sala.codigo, value: JSON.stringify({
+            type:      'PlayerReconnected',
+            source:    'gateway',
+            timestamp: Date.now(),
+            data:      { codigo: sala.codigo, playerId },
+          })}],
+        });
         socket.emit('game:state', sala);
         log.info(`reconexión: ${playerId} → sala ${sala.codigo}`);
         break;
@@ -161,35 +180,30 @@ io.on('connection', async (socket) => {
     log.error('error en reconexión:', err.message);
   }
 
-  // DOMF002 — Enrutar eventos del cliente a los canales Redis correspondientes
-  for (const [event, channel] of Object.entries(ROUTES)) {
+  // DOMF002 — Enrutar eventos del cliente a topics Kafka
+  for (const [event, topic] of Object.entries(ROUTES)) {
     socket.on(event, (payload = {}) => {
-      const message = {
-        type:          event,
-        source:        'gateway',
-        timestamp:     Date.now(),
-        version:       1,
-        correlationId: crypto.randomUUID(),
-        data: {
-          socketId: socket.id,
-          playerId: socket.user.sub,
-          ...payload,
-        },
-      };
-      pub.publish(channel, JSON.stringify(message));
-      log.info(`${event} → ${channel}`);
+      const message = buildMessage(event, socket.id, socket.user.sub, payload);
+      producer.send({
+        topic,
+        messages: [{ key: payload.codigo ?? socket.id, value: JSON.stringify(message) }],
+      }).catch((err) => log.error('kafka send error —', err.message));
+      log.info(`${event} → ${topic}`);
     });
   }
 
-  // DOMF002 — Notificar desconexión para que Room Service interprete
+  // DOMF002 — Notificar desconexión al Room Service vía Kafka
   socket.on('disconnect', () => {
     log.info('cliente desconectado:', socket.id);
-    pub.publish('svc:room', JSON.stringify({
-      type:      'PlayerDisconnected',
-      source:    'gateway',
-      timestamp: Date.now(),
-      data:      { socketId: socket.id, playerId: socket.user.sub },
-    }));
+    producer.send({
+      topic:    'cmd.room',
+      messages: [{ value: JSON.stringify({
+        type:      'PlayerDisconnected',
+        source:    'gateway',
+        timestamp: Date.now(),
+        data:      { socketId: socket.id, playerId: socket.user.sub },
+      })}],
+    }).catch((err) => log.error('kafka disconnect error —', err.message));
   });
 });
 
