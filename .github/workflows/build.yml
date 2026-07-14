@@ -1,0 +1,30 @@
+name: Build & Push Docker Image
+
+# Pipeline INDEPENDIENTE de este repo: se dispara solo cuando ESTE servicio
+# cambia. La lógica real de build+push vive en battlecaos-infra (workflow
+# reusable) — ver ese repo para el detalle. Requiere en Settings → Secrets de
+# ESTE repo: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID (mismos
+# valores que battlecaos-infra — ver terraform/DESPLIEGUE.md §E).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente destino"
+        type: choice
+        options: [dev, test, prod]
+        default: dev
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    uses: BattleCaos-Ship/battlecaos-infra/.github/workflows/build-push-image.yml@main
+    with:
+      service: gateway
+      environment: ${{ inputs.environment || 'dev' }}
+    secrets: inherit

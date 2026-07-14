@@ -4,46 +4,52 @@ import { ROUTES, buildMessage } from '../router.js';
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 
 describe('ROUTES', () => {
-  it('mapea room:create a svc:room', () => {
-    expect(ROUTES['room:create']).toBe('svc:room');
+  it('mapea room:create a cmd.room', () => {
+    expect(ROUTES['room:create']).toBe('cmd.room');
   });
 
-  it('mapea room:join a svc:room', () => {
-    expect(ROUTES['room:join']).toBe('svc:room');
+  it('mapea room:join a cmd.room', () => {
+    expect(ROUTES['room:join']).toBe('cmd.room');
   });
 
-  it('mapea disparo:realizar a svc:game', () => {
-    expect(ROUTES['disparo:realizar']).toBe('svc:game');
+  it('mapea los eventos de lobby (equipo/comenzar/salir) a cmd.room', () => {
+    expect(ROUTES['room:cambiar-equipo']).toBe('cmd.room');
+    expect(ROUTES['room:comenzar']).toBe('cmd.room');
+    expect(ROUTES['room:salir']).toBe('cmd.room');
   });
 
-  it('mapea salva:disparo a svc:game', () => {
-    expect(ROUTES['salva:disparo']).toBe('svc:game');
+  it('mapea disparo:realizar a cmd.game', () => {
+    expect(ROUTES['disparo:realizar']).toBe('cmd.game');
   });
 
-  it('mapea poder:usar a svc:game', () => {
-    expect(ROUTES['poder:usar']).toBe('svc:game');
+  it('mapea salva:disparo a cmd.game', () => {
+    expect(ROUTES['salva:disparo']).toBe('cmd.game');
   });
 
-  it('mapea colocacion:set a svc:game', () => {
-    expect(ROUTES['colocacion:set']).toBe('svc:game');
+  it('mapea poder:usar a cmd.game', () => {
+    expect(ROUTES['poder:usar']).toBe('cmd.game');
   });
 
-  it('mapea contramedida:activar a svc:game', () => {
-    expect(ROUTES['contramedida:activar']).toBe('svc:game');
+  it('mapea colocacion:set a cmd.game', () => {
+    expect(ROUTES['colocacion:set']).toBe('cmd.game');
   });
 
-  it('mapea chat:mensaje a svc:chat', () => {
-    expect(ROUTES['chat:mensaje']).toBe('svc:chat');
+  it('mapea contramedida:activar a cmd.game', () => {
+    expect(ROUTES['contramedida:activar']).toBe('cmd.game');
   });
 
-  it('tiene exactamente 8 rutas definidas', () => {
-    expect(Object.keys(ROUTES)).toHaveLength(8);
+  it('mapea chat:mensaje a cmd.chat', () => {
+    expect(ROUTES['chat:mensaje']).toBe('cmd.chat');
   });
 
-  it('todos los valores son canales Redis válidos (svc:*)', () => {
-    const channels = Object.values(ROUTES);
-    for (const ch of channels) {
-      expect(ch).toMatch(/^svc:/);
+  it('tiene exactamente 11 rutas definidas', () => {
+    expect(Object.keys(ROUTES)).toHaveLength(11);
+  });
+
+  it('todos los valores son topics Kafka válidos (cmd.*)', () => {
+    const topics = Object.values(ROUTES);
+    for (const t of topics) {
+      expect(t).toMatch(/^cmd\./);
     }
   });
 });

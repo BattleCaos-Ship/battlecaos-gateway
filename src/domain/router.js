@@ -1,6 +1,9 @@
 export const ROUTES = {
   'room:create':          'cmd.room',
   'room:join':            'cmd.room',
+  'room:cambiar-equipo':  'cmd.room',
+  'room:comenzar':        'cmd.room',
+  'room:salir':           'cmd.room',
   'disparo:realizar':     'cmd.game',
   'salva:disparo':        'cmd.game',
   'poder:usar':           'cmd.game',

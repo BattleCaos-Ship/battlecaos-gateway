@@ -2,7 +2,7 @@ import { Kafka } from 'kafkajs';
 
 const config = {
   clientId: process.env.KAFKA_CLIENT_ID ?? 'battlecaos-gateway',
-  brokers:  [process.env.KAFKA_BROKER   ?? 'localhost:9092'],
+  brokers:  (process.env.KAFKA_BROKER ?? 'localhost:9092').split(',').map((b) => b.trim()), // acepta lista: b1:9092,b2:9093
 };
 
 if (process.env.KAFKA_USERNAME) {
