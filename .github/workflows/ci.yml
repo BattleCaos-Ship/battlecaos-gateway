@@ -1,0 +1,22 @@
+name: CI — Tests + Cobertura + Sonar
+
+# CI de CALIDAD de este repo: corre en PRs hacia main/develop y en pushes a ramas
+# feature (donde se trabaja). La lógica vive en battlecaos-infra/ci-test.yml
+# (reusable). El deploy NO ocurre aquí — eso es build.yml, y solo desde main.
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches-ignore: [main] # en main el que corre es build.yml (que YA incluye estos tests como gate)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: BattleCaos-Ship/battlecaos-infra/.github/workflows/ci-test.yml@main
+    with:
+      service: gateway
+    secrets: inherit

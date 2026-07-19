@@ -47,3 +47,12 @@ export const activeSocketsGauge = new client.Gauge({
   help: 'Sockets conectados actualmente',
   registers: [register],
 });
+
+// 1 = el consumer de Kafka está unido al grupo y procesando; 0 = crasheó y aún no reconecta.
+// Lo lee /health: si está en 0, la liveness probe reinicia la réplica (un consumer colgado deja
+// de entregar broadcasts a los clientes → la partida se congela para todos los conectados).
+export const kafkaConsumerUp = new client.Gauge({
+  name: 'gateway_kafka_consumer_up',
+  help: 'El consumer de Kafka del gateway está vivo (1) o caído (0)',
+  registers: [register],
+});

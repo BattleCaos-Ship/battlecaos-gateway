@@ -42,8 +42,18 @@ describe('ROUTES', () => {
     expect(ROUTES['chat:mensaje']).toBe('cmd.chat');
   });
 
-  it('tiene exactamente 11 rutas definidas', () => {
-    expect(Object.keys(ROUTES)).toHaveLength(11);
+  it('tiene exactamente 15 rutas definidas', () => {
+    expect(Object.keys(ROUTES)).toHaveLength(15);
+  });
+
+  it('incluye la ruta de volver a la sala → cmd.room', () => {
+    expect(ROUTES['room:volver']).toBe('cmd.room');
+  });
+
+  it('incluye las rutas de voz → cmd.voice', () => {
+    expect(ROUTES['voice:join']).toBe('cmd.voice');
+    expect(ROUTES['voice:leave']).toBe('cmd.voice');
+    expect(ROUTES['voice:mute']).toBe('cmd.voice');
   });
 
   it('todos los valores son topics Kafka válidos (cmd.*)', () => {
@@ -112,5 +122,20 @@ describe('buildMessage', () => {
   it('payload vacío no añade campos extra en data', () => {
     const msg = buildMessage('room:join', 's-1', 'uid-1');
     expect(Object.keys(msg.data)).toEqual(['socketId', 'playerId']);
+  });
+
+  // SEGURIDAD: el cliente no puede suplantar a otro jugador inyectando playerId en el payload.
+  it('un playerId inyectado en el payload NO sobreescribe el verificado por JWT', () => {
+    const msg = buildMessage('disparo:realizar', 's-1', 'uid-real', {
+      playerId: 'uid-de-la-victima', // intento de suplantación
+      codigo: '123456',
+    });
+    expect(msg.data.playerId).toBe('uid-real'); // gana el del servidor, no el del cliente
+    expect(msg.data.codigo).toBe('123456');     // el resto del payload sí pasa
+  });
+
+  it('un socketId inyectado en el payload tampoco sobreescribe el real', () => {
+    const msg = buildMessage('room:salir', 'socket-real', 'uid-1', { socketId: 'socket-falso' });
+    expect(msg.data.socketId).toBe('socket-real');
   });
 });

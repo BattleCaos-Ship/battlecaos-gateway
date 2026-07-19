@@ -2,14 +2,23 @@
   "name": "battlecaos-gateway",
   "version": "1.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/index.js",
+    "start:traced": "node --import ./src/tracing.js src/index.js",
     "dev": "nodemon src/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "coverage": "vitest run --coverage"
+    "coverage": "vitest run --coverage --coverage.reporter=text --coverage.reporter=html --coverage.reporter=lcov"
   },
   "dependencies": {
+    "@opentelemetry/auto-instrumentations-node": "^0.78.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.220.0",
+    "@opentelemetry/resources": "^2.9.0",
+    "@opentelemetry/sdk-node": "^0.220.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.0",
     "express": "^4.19.0",
@@ -30,8 +39,14 @@
   "vitest": {
     "coverage": {
       "provider": "v8",
-      "include": ["src/domain/**"],
-      "reporter": ["text", "html"]
+      "include": [
+        "src/domain/**"
+      ],
+      "reporter": [
+        "text",
+        "html",
+        "lcov"
+      ]
     }
   }
 }

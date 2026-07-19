@@ -7,12 +7,15 @@ import cors from 'cors';
 import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
 import { createRedis } from './redis.js';
+import { conLockSala } from './lock.js';
+import { crearBackoff } from './backoff.js';
 import { producer, createConsumer } from './kafka.js';
 import { log } from './logger.js';
 import { ROUTES, buildMessage } from './domain/router.js';
 import {
   register, httpDuration, socketConnectionsTotal, eventsRoutedTotal,
   rateLimitExceededTotal, reconnectionsTotal, kafkaConsumerCrashTotal, activeSocketsGauge,
+  kafkaConsumerUp,
 } from './metrics.js';
 import { httpMetricsMiddleware } from './httpMetricsMiddleware.js';
 
@@ -65,17 +68,40 @@ await producer.connect();
 // hace que todos reciban todo (el balanceador solo necesita sticky sessions).
 const consumer = createConsumer(`gateway-group-${INSTANCE_ID}`);
 
-// DOMF1302 — /health con ping Redis real
+// Salud del consumer de Kafka del gateway (mismo patrón que trackConsumer en los servicios
+// internos). Un consumer colgado deja de entregar broadcasts → la partida se congela para
+// los clientes conectados a esta réplica, aunque Redis siga respondiendo. Sin esto, /health
+// daba 200 igual y la liveness probe NUNCA reiniciaba la réplica (el hueco del hallazgo v2).
+let consumerVivo    = false; // ¿está procesando ahora mismo?
+let consumerUnidoAlguna = false; // ¿llegó a unirse al grupo alguna vez? (evita 503 en el arranque)
+function marcarConsumer(vivo) {
+  consumerVivo = vivo;
+  if (vivo) consumerUnidoAlguna = true;
+  kafkaConsumerUp.set(vivo ? 1 : 0);
+}
+// Backoff exponencial + jitter para reconectar (antes: 5s fijos → thundering herd al volver Kafka).
+const reconexionKafka = crearBackoff({ baseMs: 1000, maxMs: 30000 });
+consumer.on(consumer.events.GROUP_JOIN, () => { marcarConsumer(true); reconexionKafka.reset(); });
+consumer.on(consumer.events.CONNECT,    () => marcarConsumer(true));
+consumer.on(consumer.events.STOP,       () => marcarConsumer(false));
+consumer.on(consumer.events.DISCONNECT, () => marcarConsumer(false));
+
+// DOMF1302 — /health: ping Redis real + salud del consumer de Kafka. Devuelve 503 (→ la
+// liveness probe reinicia) si Redis no responde O si el consumer se unió alguna vez pero
+// ahora está caído. Durante el arranque (antes del primer GROUP_JOIN) no penaliza.
 app.get('/health', async (_req, res) => {
   try {
     const ping = await redis.ping();
-    res.json({
+    const consumerCaido = consumerUnidoAlguna && !consumerVivo;
+    const estado = {
       service:   'gateway',
-      status:    'ok',
+      status:    consumerCaido ? 'error' : 'ok',
       redis:     ping === 'PONG' ? 'ok' : 'degraded',
+      kafka:     consumerUnidoAlguna ? (consumerVivo ? 'ok' : 'down') : 'starting',
       uptime:    process.uptime(),
       timestamp: Date.now(),
-    });
+    };
+    res.status(consumerCaido ? 503 : 200).json(estado);
   } catch (err) {
     res.status(503).json({ service: 'gateway', status: 'error', redis: 'down', error: err.message });
   }
@@ -145,7 +171,9 @@ async function startConsumer() {
 
     consumer.on(consumer.events.CRASH, async () => {
       kafkaConsumerCrashTotal.inc();
-      log.warn('kafka consumer crasheó — reconectando en 5s...');
+      marcarConsumer(false); // /health pasa a 503 → la liveness probe reinicia si no reconecta
+      const delay = reconexionKafka.siguiente();
+      log.warn(`kafka consumer crasheó — reconectando en ${delay}ms (intento ${reconexionKafka.intentos})...`);
       setTimeout(async () => {
         try {
           await consumer.disconnect();
@@ -153,7 +181,7 @@ async function startConsumer() {
         } catch (err) {
           log.error('error al reconectar consumer —', err.message);
         }
-      }, 5000);
+      }, delay);
     });
 
     await consumer.run({
@@ -183,8 +211,9 @@ async function startConsumer() {
     });
     log.info('kafka consumer listo');
   } catch (err) {
-    log.warn(`kafka consumer no disponible, reintentando en 5s — ${err.message}`);
-    setTimeout(startConsumer, 5000);
+    const delay = reconexionKafka.siguiente();
+    log.warn(`kafka consumer no disponible, reintentando en ${delay}ms — ${err.message}`);
+    setTimeout(startConsumer, delay);
   }
 }
 
@@ -205,41 +234,160 @@ io.on('connection', async (socket) => {
 
   try {
     // O(1): el índice inverso nos da directamente la sala del jugador (antes: KEYS 'sala:*').
-    const codigo  = await redis.get(idxJugador(playerId));
-    const raw     = codigo ? await redis.get(`sala:${codigo}`) : null;
-    const sala    = raw ? JSON.parse(raw) : null;
-    const jugador = sala?.jugadores?.find((j) => j.id === playerId);
+    const codigo = await redis.get(idxJugador(playerId));
+    // El read-modify-write de la sala en la reconexión corre bajo el MISMO lock por sala
+    // que usa el game service → nunca pisa (ni es pisado por) un disparo que ocurra a la
+    // vez. Cierra la carrera cross-service del hallazgo #2.
+    if (codigo) await conLockSala(redis, codigo, async () => {
+      const raw     = await redis.get(`sala:${codigo}`);
+      const sala    = raw ? JSON.parse(raw) : null;
+      const jugador = sala?.jugadores?.find((j) => j.id === playerId);
 
-    if (sala && jugador && sala.fase !== 'FIN') {
-      socket.join(sala.codigo);
-      jugador.socketId  = socket.id;
-      jugador.conectado = true;
-      await redis.set(`sala:${sala.codigo}`, JSON.stringify(sala), 'EX', SALA_TTL_SEG); // re-aplica TTL
-      await redis.set(idxJugador(playerId), sala.codigo, 'EX', IDX_TTL_SEG); // refresca TTL
-      await producer.send({
-        topic:    'evt.room',
-        messages: [{ key: sala.codigo, value: JSON.stringify({
-          type:      'PlayerReconnected',
-          source:    'gateway',
-          timestamp: Date.now(),
-          data:      { codigo: sala.codigo, playerId },
-        })}],
-      });
-      socket.emit('game:state', sala);
-      reconnectionsTotal.inc();
-      log.info(`reconexión: ${playerId} → sala ${sala.codigo}`);
-    } else if (codigo) {
-      // Índice obsoleto (partida terminada, sala borrada, o el jugador ya no está): limpiarlo
-      // para que no vuelva a intentar reincorporar a una partida inexistente.
-      await redis.del(idxJugador(playerId));
-    }
+      if (sala && jugador && sala.fase !== 'FIN') {
+        socket.join(sala.codigo);
+        jugador.socketId  = socket.id;
+        jugador.conectado = true;
+        await redis.set(`sala:${sala.codigo}`, JSON.stringify(sala), 'EX', SALA_TTL_SEG); // re-aplica TTL
+        await redis.set(idxJugador(playerId), sala.codigo, 'EX', IDX_TTL_SEG); // refresca TTL
+        await producer.send({
+          topic:    'evt.room',
+          messages: [{ key: sala.codigo, value: JSON.stringify({
+            type:      'PlayerReconnected',
+            source:    'gateway',
+            timestamp: Date.now(),
+            data:      { codigo: sala.codigo, playerId },
+          })}],
+        });
+        socket.emit('game:state', sala);
+        reconnectionsTotal.inc();
+        log.info(`reconexión: ${playerId} → sala ${sala.codigo}`);
+      } else {
+        // Índice obsoleto (partida terminada, sala borrada, o el jugador ya no está): limpiarlo
+        // para que no vuelva a intentar reincorporar a una partida inexistente.
+        await redis.del(idxJugador(playerId));
+      }
+    });
   } catch (err) {
     log.error('error en reconexión:', err.message);
   }
 
-  // DOMF002 — Enrutar eventos del cliente a topics Kafka
+  // Re-sincronización a demanda: el cliente pide el estado actual de SU sala (p.ej.
+  // GamePage montó sin estado porque el game:state de reconexión llegó antes de que
+  // sus listeners estuvieran adjuntos — sin esto quedaba "cargando" hasta el
+  // siguiente broadcast de la partida).
+  socket.on('game:sync', async () => {
+    try {
+      const codigo = await redis.get(idxJugador(playerId));
+      const raw    = codigo ? await redis.get(`sala:${codigo}`) : null;
+      const sala   = raw ? JSON.parse(raw) : null;
+      // Una partida TERMINADA (FIN) o inexistente no debe reincorporar al jugador: se
+      // limpia el índice obsoleto para que quede libre de elegir modo / crear otra sala.
+      if (!sala || sala.fase === 'FIN') {
+        if (codigo) await redis.del(idxJugador(playerId));
+        return;
+      }
+      socket.emit('game:state', sala);
+    } catch (err) {
+      log.error('error en game:sync:', err.message);
+    }
+  });
+
+  // Modo ESPECTADOR: cualquiera con el código puede VER una partida en curso (solo
+  // lectura). Se une al room de Socket.io (recibe los game:state sanitizados que
+  // emite el game service) y recibe el estado COMPLETO (con `tableros`): el
+  // espectador ve las posiciones de las flotas de AMBOS equipos con sus sprites.
+  socket.on('room:espectar', async ({ codigo } = {}) => {
+    try {
+      const raw = codigo ? await redis.get(`sala:${String(codigo)}`) : null;
+      if (!raw) return socket.emit('room:error', { error: 'sala_no_existe' });
+      const sala = JSON.parse(raw);
+      if (sala.fase === 'LOBBY') return socket.emit('room:error', { error: 'partida_no_iniciada' });
+
+      socket.join(sala.codigo);
+      socket.emit('game:state', sala);
+      log.info(`espectador ${playerId} → sala ${sala.codigo}`);
+    } catch (err) {
+      log.error('error en room:espectar:', err.message);
+    }
+  });
+
+  socket.on('room:dejar-espectar', ({ codigo } = {}) => {
+    if (codigo) socket.leave(String(codigo));
+  });
+
+  // Preview de colocación en VIVO (2v2): mientras un jugador acomoda sus barcos (antes
+  // de confirmar), su COMPAÑERO ve cada barco donde lo va poniendo. Reenviado VÍA KAFKA
+  // (gw.broadcast) por la misma razón que voice:signal: con 2+ réplicas del gateway, el
+  // compañero puede estar en OTRA réplica y un io.to() local nunca le llegaría.
+  socket.on('colocacion:preview', async ({ codigo, ships } = {}) => {
+    try {
+      if (!codigo || !Array.isArray(ships) || ships.length > 8) return;
+      const raw = await redis.get(`sala:${String(codigo)}`);
+      if (!raw) return;
+      const sala = JSON.parse(raw);
+      const yo = sala.jugadores?.find((j) => j.id === playerId);
+      if (!yo) return;
+      for (const j of sala.jugadores) {
+        if (j.id === playerId || j.equipo !== yo.equipo || j.esBot) continue;
+        await producer.send({
+          topic:    'gw.broadcast',
+          messages: [{ key: String(j.id), value: JSON.stringify({
+            roomId: j.id, event: 'equipo:preview', payload: { de: playerId, ships },
+          })}],
+        });
+      }
+    } catch (err) {
+      log.error('error en colocacion:preview:', err.message);
+    }
+  });
+
+  // Señalización WebRTC de VOZ (SDP/ICE) — relay efímero validado (misma sala) y
+  // reenviado VÍA KAFKA (gw.broadcast), NO con io.to() local. Con el gateway en
+  // ACTIVO/ACTIVO (2+ réplicas), cada jugador puede estar conectado a una réplica
+  // DISTINTA: un io.to(to) local solo alcanza los sockets de ESTA réplica → la
+  // señalización nunca cruzaba y la voz quedaba en "conectando" para siempre.
+  // gw.broadcast hace fan-out a TODAS las réplicas y la dueña del socket entrega.
+  socket.on('voice:signal', async ({ codigo, to, data } = {}) => {
+    try {
+      if (!codigo || !to || data == null) return;
+      const raw = await redis.get(`sala:${String(codigo)}`);
+      if (!raw) return;
+      const sala = JSON.parse(raw);
+      const yo      = sala.jugadores?.some((j) => j.id === playerId);
+      const destino = sala.jugadores?.some((j) => j.id === to);
+      if (!yo || !destino) return;
+      await producer.send({
+        topic:    'gw.broadcast',
+        messages: [{ key: String(to), value: JSON.stringify({
+          roomId: to, event: 'voice:signal', payload: { from: playerId, data },
+        })}],
+      });
+    } catch (err) {
+      log.error('error en voice:signal:', err.message);
+    }
+  });
+
+  // DOMF002 — Enrutar eventos del cliente a topics Kafka, con RATE LIMIT POR EVENTO.
+  // El io.use() de arriba solo limita HANDSHAKES (1 vez por conexión); esto limita el
+  // VOLUMEN de eventos de un socket ya conectado (antivector de DoS y anti-flood). La
+  // ventana es por PLAYER (socket.user.sub), no por IP: varios jugadores tras el mismo
+  // NAT (sala de clase) no se estorban entre sí.
+  const EVENT_LIMIT   = 30;  // eventos por ventana
+  const EVENT_WINDOW  = 1;   // segundos
   for (const [event, topic] of Object.entries(ROUTES)) {
-    socket.on(event, (payload = {}) => {
+    socket.on(event, async (payload = {}) => {
+      try {
+        const key   = `ratelimit:evt:${socket.user.sub}`;
+        const count = await redis.incr(key);
+        if (count === 1) await redis.expire(key, EVENT_WINDOW);
+        if (count > EVENT_LIMIT) {
+          rateLimitExceededTotal.inc();
+          socket.emit('rate_limited', { event });
+          return; // se descarta el evento; el cliente legítimo casi nunca llega aquí
+        }
+      } catch (err) {
+        log.error('rate limit check falló —', err.message); // fail-open: no bloquear por un fallo de Redis
+      }
       const message = buildMessage(event, socket.id, socket.user.sub, payload);
       producer.send({
         topic,
