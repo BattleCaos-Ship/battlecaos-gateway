@@ -1,0 +1,61 @@
+name: Build & Push Docker Image
+
+# Pipeline de DESPLIEGUE de este repo — SOLO desde main (main = producción).
+# Flujo: tests (GATE de calidad) → build+push a dev → aprobación manual (environment
+# 'qa' de GitHub) → despliegue a QA (ambiente test de Terraform).
+# La lógica real vive en battlecaos-infra (workflows reusables). Secrets requeridos
+# en Settings → Secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+# (+ SONAR_TOKEN/SONAR_HOST_URL opcionales para el análisis Sonar del gate).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente destino"
+        type: choice
+        options: [dev, test, prod]
+        default: dev
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # GATE de calidad: si los tests fallan, NO se construye ni despliega nada.
+  test:
+    uses: BattleCaos-Ship/battlecaos-infra/.github/workflows/ci-test.yml@main
+    with:
+      service: gateway
+    secrets: inherit
+
+  build:
+    needs: test
+    uses: BattleCaos-Ship/battlecaos-infra/.github/workflows/build-push-image.yml@main
+    with:
+      service: gateway
+      environment: ${{ inputs.environment || 'dev' }}
+    secrets: inherit
+
+  # ── Promoción a QA (solo en push a main, tras dev exitoso) ────────────────
+  # El job 'qa-aprobacion' usa el GitHub Environment 'qa': si el environment tiene
+  # "required reviewers", GitHub PAUSA aquí hasta que un humano apruebe. Recién
+  # entonces se despliega al ambiente test de Azure (battlecaostest-*). Requiere
+  # haber creado el environment 'qa' en Settings → Environments y haber aplicado
+  # Terraform del ambiente test (environments/test.tfvars).
+  qa-aprobacion:
+    if: github.event_name == 'push'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - run: echo "Aprobado el pase a QA de gateway"
+
+  deploy-qa:
+    needs: qa-aprobacion
+    uses: BattleCaos-Ship/battlecaos-infra/.github/workflows/build-push-image.yml@main
+    with:
+      service: gateway
+      environment: test
+    secrets: inherit
